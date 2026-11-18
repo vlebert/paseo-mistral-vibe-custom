@@ -45,6 +45,29 @@ usage data, monthly budget in the usage modal, and conversation rewind.
 - **Security**: plugin code is trusted and unsandboxed on the daemon host. Never log
   credentials; the side channel only carries session/message ids.
 
+## Cross-provider session history (mistral-vibe vs mistral-vibe-custom)
+
+Both providers spawn the same `vibe-acp` binary, so they share one session store
+(`session/list` returns the same native session ids for both — verified against the daemon
+via `fetchRecentProviderSessions` with each provider filter). Consequences:
+
+- The Custom provider already lists AND opens conversations created with the native
+  provider (and vice versa): `session.open` with `persistence.data.sessionId` maps to
+  vibe-acp `session/load`. Verified end-to-end: importing a native-created vibe session
+  through `mistral-vibe-custom` replays its history correctly.
+- The apparent "split" is daemon-side, not plugin-side: listing entries are tagged with
+  the listing provider and the handle encoding differs (native: raw uuid; plugin:
+  `plugin:{...}`), so the same conversation can appear once per provider in the combined
+  import view, and the "already imported" filter is keyed `(provider, handle)` — importing
+  under one provider does not hide it under the other. The plugin cannot change either:
+  the `plugin:` encoding and the per-provider dedup key live in the daemon
+  (`plugin-provider.js` `encodePersistence`, `import-sessions.js`
+  `toProviderSessionHandleKey`). True cross-provider dedup is an upstream Paseo change.
+- vibe enforces a per-session lease (`vibe/core/session/session_lease.py`): a session can
+  only be open in one vibe-acp process at a time ("Session is already open"), so the same
+  conversation cannot be open simultaneously under both providers — same limitation as
+  within a single provider.
+
 ## External code review (2026-11-18, subagent "reviewer")
 
 Verdict before fixes: "not safe with parallel sessions". Findings and their fixes:
