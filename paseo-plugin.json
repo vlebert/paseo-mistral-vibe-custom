@@ -1,0 +1,8 @@
+{
+  "id": "mistral-vibe-custom",
+  "name": "Mistral Vibe Custom",
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.16.0"
+  }
+}
