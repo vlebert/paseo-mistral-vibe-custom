@@ -27,6 +27,15 @@ usage data, monthly budget in the usage modal, and conversation rewind.
   so the plugin owns the vibe-acp process through a custom connector (`server/vibe-acp.ts`)
   with a JSON-RPC side channel. If Paseo ships native ACP revert (getpaseo/paseo#5748),
   delete the connector/wrapper and keep only the transformers.
+- **The spawn env must carry the session env**: owning the process means repeating what the
+  stock shim does — `{ ...launch.env, ...config.env }`. `launch.env` is the daemon env; the
+  per-agent identity (`PASEO_AGENT_ID`, `PASEO_AGENT_CWD`, `PASEO_WORKSPACE_ID`) only travels
+  in `session.open` → `config.env` (daemon: `mapSessionConfig`). Spawn without it and
+  `paseo run` launched from inside the agent loses `callerAgentId` (no parent link). The shim
+  calls `connector()` without arguments, synchronously while dispatching an input, so the
+  `pendingSessionEnv` FIFO in `server/provider.ts` maps one queued env per spawning input
+  (`session.open`, `catalog`, `sessions`) to the process it starts. Keep it aligned, including
+  the drop path for an input rejected by validation.
 - **Process↔session mapping is exact, not positional**: each handle records the native
   session ids it serves (from `session/new` responses and `session/load` requests) and is
   matched by id at `session.opened`. Do not reintroduce index-based heuristics; parallel
@@ -96,6 +105,19 @@ Re-verified after fixes: `npx tsc --noEmit` exit 0; plugin reloads running; 3 pa
 agents answered correctly with exact native-id mapping; `pgrep vibe-acp` back to baseline
 after archiving test agents (no leaks); `paseo usage ls --json --refresh` shows only the
 monthly allowance window.
+
+### Spawn env fix (2026-11-19)
+
+Bug: every plugin-spawned `vibe-acp` ran with the daemon env only — no `PASEO_AGENT_ID` —
+so `paseo run` from inside a Vibe agent had no caller id (no parent label, `create_agent`
+fallbacks). Cause was always in the plugin, not the daemon: `resolveLaunch()` is
+provider-level and cannot know an agent, so the daemon ships the identity per session in
+`session.open` → `config.env`; the shim's command path merges it, our connector did not.
+Fix verified with a fake ACP agent: baseline `HEAD` dumped 4 spawns without `PASEO_*`;
+patched dump shows each session's own `PASEO_AGENT_ID`/`PASEO_AGENT_CWD`/
+`PASEO_WORKSPACE_ID`, probes still in the daemon env, and an open rejected by schema
+validation consumes no slot. Real-daemon check happens on the next plugin reload: agent
+process env must contain the three `PASEO_*` keys matching `paseo inspect <id>`.
 
 ## Layout
 

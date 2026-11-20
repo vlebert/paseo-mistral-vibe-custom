@@ -50,6 +50,27 @@ export function createVibeCustomProvider(): ProviderRegistration {
   // sequential per provider registration).
   const contexts: ConnCtx[] = [];
   let currentLaunch: ProviderLaunch | undefined;
+  /**
+   * Env queued for a spawn, oldest first. The shim calls `connector()` synchronously while
+   * dispatching an input, so the order of `send()` below is the order of the spawns: every
+   * input that starts a process queues its session env here, the connector consumes the
+   * oldest one (why it matters: see `startVibeAcp`). An entry is dropped when `inner.send`
+   * rejects before dispatching, so a failed open cannot shift the next one.
+   */
+  const pendingSessionEnv: Array<{ env: Readonly<Record<string, string>>; dropped: boolean }> = [];
+
+  function queueSessionEnv(env: Readonly<Record<string, string>>) {
+    const entry = { env, dropped: false };
+    pendingSessionEnv.push(entry);
+    return entry;
+  }
+
+  function takeSessionEnv(): Readonly<Record<string, string>> {
+    for (let entry = pendingSessionEnv.shift(); entry; entry = pendingSessionEnv.shift()) {
+      if (!entry.dropped) return entry.env;
+    }
+    return {};
+  }
 
   const base = runAcpProvider({
     id: PLUGIN_ID,
@@ -59,7 +80,7 @@ export function createVibeCustomProvider(): ProviderRegistration {
     icon: "icon.svg",
     connector: () => {
       const ctx = contexts[contexts.length - 1];
-      const handle = startVibeAcp(currentLaunch, (message) => {
+      const handle = startVibeAcp(currentLaunch, takeSessionEnv(), (message) => {
         if (!ctx || ctx.closed) return;
         if (!("method" in message) || "id" in message || message.method !== "session/update") return;
         const params = (message.params ?? {}) as { sessionId?: unknown; update?: Record<string, unknown> };
@@ -231,7 +252,21 @@ export function createVibeCustomProvider(): ProviderRegistration {
             }
             return;
           }
-          await inner.send(input);
+          // Inputs the shim answers by starting a process through `connector`; each one
+          // queues the env that process must inherit. `catalog` and `sessions` probes run
+          // in the daemon env, but they still consume a slot, hence the empty object.
+          const queued =
+            input.type === "session.open"
+              ? queueSessionEnv(input.config.env)
+              : input.type === "catalog" || input.type === "sessions"
+                ? queueSessionEnv({})
+                : undefined;
+          try {
+            await inner.send(input);
+          } catch (error) {
+            if (queued) queued.dropped = true;
+            throw error;
+          }
         },
         onEvent(listener) {
           ctx.listeners.add(listener);

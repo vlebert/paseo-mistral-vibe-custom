@@ -30,11 +30,21 @@ interface PendingRequest {
  *
  * Lifecycle: cancelling the readable or closing the writable terminates the child and
  * rejects all pending side-channel requests, so no process outlives its connection.
+ *
+ * `sessionEnv` is the per-agent env the daemon sends with `session.open` (`config.env`):
+ * it carries `PASEO_AGENT_ID`, `PASEO_AGENT_CWD` and `PASEO_WORKSPACE_ID`. The stock shim
+ * spawns with `{ ...launch.env, ...config.env }`; owning the process means repeating that
+ * merge. `launch.env` alone is the daemon env and holds no identity, so the agent would
+ * lose its caller (`paseo run` from inside it drops `callerAgentId`).
  */
-export function startVibeAcp(launch: ProviderLaunch | undefined, onMessage?: MessageTap): VibeAcpHandle {
+export function startVibeAcp(
+  launch: ProviderLaunch | undefined,
+  sessionEnv: Readonly<Record<string, string>> = {},
+  onMessage?: MessageTap,
+): VibeAcpHandle {
   const command = launch?.command ?? "vibe-acp";
   const args = launch?.args ?? [];
-  const env = launch?.env ?? process.env;
+  const env = { ...(launch?.env ?? process.env), ...sessionEnv };
   const child = spawnProcess(command, args, { env, stdio: "pipe" });
   child.stderr.on("data", () => undefined);
   child.stdin.on("error", () => undefined); // EPIPE after child death
