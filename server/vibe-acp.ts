@@ -8,11 +8,53 @@ export interface VibeAcpHandle {
   readonly nativeSessionIds: Set<string>;
   /** Send a raw JSON-RPC request to the vibe-acp process (standard or "_"-prefixed extension). */
   callExt(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
+  /** Answer a request the tap kept away from the shim (elicitation/create). */
+  respond(id: string | number, result: unknown): void;
   close(): Promise<void>;
 }
 
-/** Raw message tap: called for every parsed inbound JSON-RPC message before the shim sees it. */
-export type MessageTap = (message: AcpStreamMessage) => void;
+/**
+ * Raw message tap: called for every parsed inbound JSON-RPC message before the shim sees it.
+ * Return `false` to keep the message away from the shim entirely — the shim only knows
+ * standard ACP requests and would answer `method not found` to anything else.
+ */
+export type MessageTap = (message: AcpStreamMessage) => boolean | void;
+
+/**
+ * Declare the ACP elicitation capability on the outbound `initialize`.
+ *
+ * vibe-acp reads `clientCapabilities.elicitation.form` at initialize time and, when the client
+ * stays silent, drops `ask_user_question` from the model's tool list (see `_supports_user_input`
+ * and NON_INTERACTIVE_DISABLED_TOOLS in vibe/acp/agent.py). Paseo's shim sends
+ * `clientCapabilities: {}`, so the tool never reaches the model. We own the child, so we patch
+ * the one field the shim does not send and answer the resulting `elicitation/create` requests
+ * ourselves (provider.ts), because the shim would reply "method not found" to them.
+ *
+ * `form` must be an OBJECT: the Python SDK types it as `ElicitationFormCapabilities` and
+ * rejects `true` with -32602.
+ */
+function withElicitationCapability(message: AcpStreamMessage): AcpStreamMessage {
+  if (!("method" in message) || message.method !== "initialize") return message;
+  const params = (message.params ?? {}) as Record<string, unknown>;
+  const current = params.clientCapabilities;
+  const clientCapabilities =
+    typeof current === "object" && current !== null && !Array.isArray(current)
+      ? (current as Record<string, unknown>)
+      : {};
+  const currentElicitation = clientCapabilities.elicitation;
+  const elicitation =
+    typeof currentElicitation === "object" && currentElicitation !== null && !Array.isArray(currentElicitation)
+      ? currentElicitation
+      : {};
+  return {
+    ...message,
+    params: {
+      ...params,
+      // Merge instead of replace: the host may already advertise other elicitation modes.
+      clientCapabilities: { ...clientCapabilities, elicitation: { ...elicitation, form: {} } },
+    },
+  } as AcpStreamMessage;
+}
 
 const MAX_BUFFER_CHARS = 16 * 1024 * 1024;
 const DEFAULT_EXT_TIMEOUT_MS = 30_000;
@@ -120,7 +162,7 @@ export function startVibeAcp(
               else entry.resolve((message as { result: unknown }).result);
             }
           }
-          onMessage?.(message);
+          if (onMessage?.(message) === false) continue;
           try {
             controller.enqueue(message);
           } catch {
@@ -150,14 +192,15 @@ export function startVibeAcp(
   const writable = new WritableStream<AcpStreamMessage>({
     write(message) {
       if (closed) return;
-      if ("method" in message && "id" in message && message.id !== null) {
-        outboundMethods.set(String(message.id), message.method);
-        if (message.method === "session/load") {
-          const sessionId = (message.params as { sessionId?: unknown } | undefined)?.sessionId;
+      const outgoing = withElicitationCapability(message);
+      if ("method" in outgoing && "id" in outgoing && outgoing.id !== null) {
+        outboundMethods.set(String(outgoing.id), outgoing.method);
+        if (outgoing.method === "session/load") {
+          const sessionId = (outgoing.params as { sessionId?: unknown } | undefined)?.sessionId;
           if (typeof sessionId === "string") nativeSessionIds.add(sessionId);
         }
       }
-      child.stdin.write(encoder.encode(`${JSON.stringify(message)}\n`));
+      child.stdin.write(encoder.encode(`${JSON.stringify(outgoing)}\n`));
     },
     close() {
       shutdown(new Error("vibe-acp stream closed"));
@@ -186,6 +229,10 @@ export function startVibeAcp(
         pending.set(id, { resolve, reject, timer });
         child.stdin.write(encoder.encode(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`));
       });
+    },
+    respond(id, result) {
+      if (closed) return;
+      child.stdin.write(encoder.encode(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`));
     },
     async close() {
       shutdown(new Error("vibe-acp handle closed"));

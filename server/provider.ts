@@ -1,4 +1,5 @@
-import { runAcpProvider } from "@getpaseo/plugin/server/acp";
+import { runAcpProvider, type AcpStreamMessage } from "@getpaseo/plugin/server/acp";
+import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import type {
   ProviderConnectRequest,
   ProviderConnection,
@@ -8,6 +9,14 @@ import type {
   ProviderRegistration,
 } from "@getpaseo/plugin/server/provider";
 import { startVibeAcp, type VibeAcpHandle } from "./vibe-acp.js";
+import {
+  answersFromPermission,
+  isQuestionPermission,
+  isToolQuestionInput,
+  questionFromElicitation,
+  type ElicitationResult,
+  type PendingQuestion,
+} from "./questions.js";
 import {
   PLUGIN_ID,
   currentThinkingOptions,
@@ -31,6 +40,14 @@ interface LatestVibeUsage {
   model?: string;
 }
 
+/** A question card waiting for the user, with the callback that answers the child. */
+interface PendingQuestionEntry {
+  /** Boundary (Paseo) session id, to settle the card when that session stops. */
+  sessionId: string;
+  pending: PendingQuestion;
+  respond: (result: ElicitationResult) => void;
+}
+
 /** All mutable state is per connection, so parallel sessions and reconnects stay isolated. */
 interface ConnCtx {
   handles: VibeAcpHandle[];
@@ -40,6 +57,10 @@ interface ConnCtx {
   lastUserMessage: Map<string, ProviderEvent & { type: "timeline.item" }>;
   latestUsage: Map<string, LatestVibeUsage>;
   sessionModel: Map<string, string>;
+  /** Permission id -> question waiting for the user (only ids minted by this plugin). */
+  pendingQuestions: Map<string, PendingQuestionEntry>;
+  /** Native session id -> `rawInput` of the last ask_user_question tool call, until used. */
+  pendingToolQuestions: Map<string, JsonValue>;
   listeners: Set<(event: ProviderEvent) => void>;
   emit: (event: ProviderEvent) => void;
   closed: boolean;
@@ -80,13 +101,66 @@ export function createVibeCustomProvider(): ProviderRegistration {
     icon: "icon.svg",
     connector: () => {
       const ctx = contexts[contexts.length - 1];
+      let child: VibeAcpHandle | undefined;
+
+      /**
+       * vibe answers the model's `ask_user_question` tool with a client-bound
+       * `elicitation/create` request, which the ACP shim does not know (it would answer
+       * "method not found" and the turn would fail). Surface it as a `session.permission` of
+       * kind "question" - the shape Paseo's shared question card renders - and keep the
+       * request id so the user's answer can go back on the child's stdin.
+       */
+      const answerQuestion = (message: AcpStreamMessage) => {
+        if (!("method" in message)) return;
+        const rpcId = "id" in message ? (message.id ?? null) : null;
+        const params = message.params as { sessionId?: unknown } | undefined;
+        const native = typeof params?.sessionId === "string" ? params.sessionId : undefined;
+        const boundary = native && ctx ? ctx.boundaryByNative.get(native) : undefined;
+        const captured = native && ctx ? ctx.pendingToolQuestions.get(native) : undefined;
+        const built =
+          native && rpcId !== null
+            ? questionFromElicitation(rpcId, message.params, native, captured)
+            : null;
+        if (!ctx || !native || !boundary || !built) {
+          // Nothing to render: hand the turn back instead of leaving the model waiting.
+          console.error(
+            `[mistral-vibe-custom] ask_user_question could not be surfaced (session=${native ?? "?"}, rpc=${String(rpcId)}); declining`,
+          );
+          if (rpcId !== null) child?.respond(rpcId, { action: "decline" });
+          return;
+        }
+        ctx.pendingToolQuestions.delete(native);
+        const { permission, pending } = built;
+        ctx.pendingQuestions.set(permission.id, {
+          sessionId: boundary,
+          pending,
+          respond: (result) => child?.respond(pending.rpcId, result),
+        });
+        ctx.emit({ type: "session.permission", sessionId: boundary, request: permission });
+      };
+
       const handle = startVibeAcp(currentLaunch, takeSessionEnv(), (message) => {
         if (!ctx || ctx.closed) return;
+        // Owned by us: only ever forwarded to the user, never to the shim.
+        if ("method" in message && message.method === "elicitation/create") {
+          answerQuestion(message);
+          return false;
+        }
         if (!("method" in message) || "id" in message || message.method !== "session/update") return;
         const params = (message.params ?? {}) as { sessionId?: unknown; update?: Record<string, unknown> };
         const native = typeof params.sessionId === "string" ? params.sessionId : undefined;
         const boundary = native ? ctx.boundaryByNative.get(native) : undefined;
         if (!params.update) return;
+        // The tool call carries what the elicitation schema drops (option descriptions,
+        // hideOther); keep it until the matching elicitation arrives.
+        const toolInput = params.update.rawInput ?? params.update.raw_input;
+        if (
+          native &&
+          (params.update.sessionUpdate ?? params.update.session_update) === "tool_call" &&
+          isToolQuestionInput(toolInput)
+        ) {
+          ctx.pendingToolQuestions.set(native, toolInput);
+        }
         for (const update of processSessionUpdate(params.update, native, boundary ?? null)) {
           if (update.type === "timeline" && boundary && update.item.type === "plugin" && update.item.kind === "vibe-usage") {
             // Captured for the context ring and the usage source; not emitted as an inline
@@ -107,6 +181,7 @@ export function createVibeCustomProvider(): ProviderRegistration {
           }
         }
       });
+      child = handle;
       if (ctx) ctx.handles.push(handle);
       return handle.stream;
     },
@@ -126,6 +201,8 @@ export function createVibeCustomProvider(): ProviderRegistration {
         lastUserMessage: new Map(),
         latestUsage: new Map(),
         sessionModel: new Map(),
+        pendingQuestions: new Map(),
+        pendingToolQuestions: new Map(),
         listeners: new Set(),
         emit: () => {},
         closed: false,
@@ -134,6 +211,16 @@ export function createVibeCustomProvider(): ProviderRegistration {
         for (const listener of ctx.listeners) listener(event);
       };
       contexts.push(ctx);
+
+      /** Settle every question card of a session: its child is done waiting for an answer. */
+      function cancelQuestions(sessionId: string): void {
+        for (const [permissionId, entry] of [...ctx.pendingQuestions]) {
+          if (entry.sessionId !== sessionId) continue;
+          ctx.pendingQuestions.delete(permissionId);
+          entry.respond({ action: "cancel" });
+          ctx.emit({ type: "session.permission_resolved", sessionId, permissionId });
+        }
+      }
 
       // Only advertise extra capabilities the host actually negotiated.
       const extra = EXTRA_CAPABILITIES.filter((cap) => request.capabilities.includes(cap));
@@ -177,8 +264,12 @@ export function createVibeCustomProvider(): ProviderRegistration {
           event = { ...event, capabilities: [...event.capabilities, ...extra] };
         }
         if (event.type === "session.closed") {
+          cancelQuestions(event.sessionId);
           const native = ctx.sessionNativeId.get(event.sessionId);
-          if (native) ctx.boundaryByNative.delete(native);
+          if (native) {
+            ctx.boundaryByNative.delete(native);
+            ctx.pendingToolQuestions.delete(native);
+          }
           ctx.sessionNativeId.delete(event.sessionId);
           ctx.sessionHandle.delete(event.sessionId);
           ctx.lastUserMessage.delete(event.sessionId);
@@ -239,6 +330,24 @@ export function createVibeCustomProvider(): ProviderRegistration {
         version: inner.version,
         capabilities: [...inner.capabilities, ...extra],
         async send(input: ProviderInput): Promise<void> {
+          // Question cards are ours: the shim has no ACP permission behind them, and would
+          // throw "Unknown ACP permission" for the answer.
+          if (input.type === "session.permission" && isQuestionPermission(input.permissionId)) {
+            const entry = ctx.pendingQuestions.get(input.permissionId);
+            ctx.pendingQuestions.delete(input.permissionId);
+            if (entry) entry.respond(answersFromPermission(entry.pending, input.response));
+            ctx.emit({
+              type: "session.permission_resolved",
+              sessionId: input.sessionId,
+              permissionId: input.permissionId,
+            });
+            return;
+          }
+          // An interrupt or a close cancels the callback inside vibe; settle the cards first
+          // so no request lingers as "waiting for input".
+          if (input.type === "session.interrupt" || input.type === "session.close") {
+            cancelQuestions(input.sessionId);
+          }
           if (input.type === "session.revert") {
             try {
               await doRevert(input);
@@ -276,6 +385,8 @@ export function createVibeCustomProvider(): ProviderRegistration {
         },
         async close() {
           ctx.closed = true;
+          ctx.pendingQuestions.clear();
+          ctx.pendingToolQuestions.clear();
           const idx = contexts.indexOf(ctx);
           if (idx >= 0) contexts.splice(idx, 1);
           // Terminating every handle this connection spawned (stream cancel would also do

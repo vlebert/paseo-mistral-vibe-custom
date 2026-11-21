@@ -2,7 +2,8 @@
 
 Paseo plugin that runs Mistral Vibe (`vibe-acp`) as a provider labeled "Mistral Vibe Custom",
 adding what the generic ACP adapter does not surface: thinking-level selector, context ring /
-usage data, monthly budget in the usage modal, and conversation rewind.
+usage data, monthly budget in the usage modal, conversation rewind, and the `ask_user_question`
+tool.
 
 ## Workflow
 
@@ -11,6 +12,9 @@ usage data, monthly budget in the usage modal, and conversation rewind.
   `paseo plugin ls` (running, no error) and `paseo plugin logs mistral-vibe-custom`.
 - Test with a real agent: `paseo run --provider mistral-vibe-custom/mistral-large-4-0-3 ...`
   then `paseo inspect <id> --json`, `paseo logs <id> --json`, `paseo usage ls --json --refresh`.
+  A prompt driving `ask_user_question` parks the agent on a card: `paseo permit ls`, then
+  `paseo permit allow <id> <req> --input '{"answers":{"<header>":"…"}}'` or `paseo permit deny`,
+  and check the tool result carries the answer.
   Archive test agents afterwards (`paseo archive <id>`) and check `pgrep vibe-acp` is back to
   baseline (child leaks are the classic bug here).
 - The desktop app caches the client bundle: restart the Paseo app to see client-side changes.
@@ -25,6 +29,22 @@ usage data, monthly budget in the usage modal, and conversation rewind.
   fields, and camelCase aliases. A vibe upgrade can break any of these silently; keep
   fallbacks and log lines (`paseo plugin logs`). The durable fix is upstream: vibe should
   use the `thought_level` category.
+- **`ask_user_question` rides on ACP elicitation, not on permissions**: vibe only offers the
+  tool when the client sends `clientCapabilities.elicitation.form` in `initialize`, as an
+  OBJECT (`{}`; `true` is -32602). The shim sends `{}`, so the stock adapter never has it: we
+  patch that key in `vibe-acp.ts`, then `provider.ts` keeps each `elicitation/create` away from
+  the shim (it would answer "method not found" and fail the turn) and turns it into a
+  `session.permission` of kind `question`, answering the child on its stdin. Payload is FLAT
+  (`{sessionId, toolCallId, message, mode: "form", requestedSchema}`), one `q0`, `q1`… per
+  question: `oneOf: [{const}]` = single choice, `items.anyOf` = multi select, `title` = header,
+  `description` = question. Reply `{action: "accept", content: {q0: "label", q1: ["a","b"]}}`;
+  vibe rejects empty strings/arrays, and `decline`/`cancel` become `cancelled: true` (the model
+  keeps its turn). The card takes `input.questions[{question, header, options[{label,
+  description}], multiSelect, allowOther}]` and keys answers by HEADER, so headers must be
+  non-empty and unique (synthesize them) and every field answerable. Never advertise the
+  capability without this bridge, and settle pending questions on interrupt/close: the tool
+  call would otherwise wait forever. Permission ids carry the native session id because two
+  children reuse JSON-RPC ids.
 - **Why the custom connector exists**: `runAcpProvider` answers `request.failed` to
   `session.revert`, so `server/vibe-acp.ts` owns the vibe-acp process with a JSON-RPC side
   channel. If Paseo ships native ACP revert (getpaseo/paseo#5748), delete the
@@ -86,6 +106,7 @@ Both providers spawn the same `vibe-acp` binary, so they share one session store
   event patching (config, usage, revertToken), `pendingSessionEnv` FIFO.
 - `server/vibe-acp.ts` — spawn + ndjson framing + native-id tracking + `callExt`.
 - `server/transformers.ts` — thinking remap (discover/configure) + `session/update` parsing.
+- `server/questions.ts` — `elicitation/create` ↔ Paseo question card mapping (pure, no state).
 - `server/usage-source.ts` — monthly budget via `_account/read` probe (one in-flight probe,
   60 s positive / 30 s negative cache).
 - `server/prices.ts` — model prices from `~/.vibe/config.toml` + cost estimate (mtime+TTL
