@@ -7,7 +7,8 @@ tool.
 
 ## Workflow
 
-- Typecheck after every change: `npx tsc --noEmit` (must exit 0).
+- Typecheck after every change: `npx tsc --noEmit` (must exit 0), plus
+  `npx tsc --noEmit --noUnusedLocals --noUnusedParameters` to catch dead code.
 - Reload on the daemon after edits: `paseo plugin reload mistral-vibe-custom`, then check
   `paseo plugin ls` (running, no error) and `paseo plugin logs mistral-vibe-custom`.
 - Test with a real agent: `paseo run --provider mistral-vibe-custom/mistral-large-4-0-3 ...`
@@ -28,7 +29,11 @@ tool.
   methods `_rewind/to` and `_account/read`, the `usage_update` payload and its `_meta`
   fields, and camelCase aliases. A vibe upgrade can break any of these silently; keep
   fallbacks and log lines (`paseo plugin logs`). The durable fix is upstream: vibe should
-  use the `thought_level` category.
+  use the `thought_level` category. Re-check after a vibe upgrade by diffing, in the installed
+  `vibe` package: `acp/utils.py` `make_thinking_response` (category, option `value`/`name`),
+  `acp/agent.py` `_send_usage_update` (`used`/`size`/`cost.amount`/`_meta` keys) and
+  `_rewind_extension` (`sessionId`/`messageId`/`restoreFiles`), plus `_build_elicitation_schema`.
+  Verified against vibe 3.1.3.
 - **`ask_user_question` rides on ACP elicitation, not on permissions**: vibe only offers the
   tool when the client sends `clientCapabilities.elicitation.form` in `initialize`, as an
   OBJECT (`{}`; `true` is -32602). The shim sends `{}`, so the stock adapter never has it: we
@@ -101,14 +106,18 @@ Both providers spawn the same `vibe-acp` binary, so they share one session store
 
 ## Layout
 
-- `index.server.ts` — registers provider + usage source.
+- `index.server.ts` — registers provider + usage source. Server-only plugin: there is no
+  `index.client.tsx` (the app skips an empty client bundle), so no React/RN devDeps.
 - `server/provider.ts` — provider wrapper: extra capabilities, `session.revert` → `_rewind/to`,
   event patching (config, usage, revertToken), `pendingSessionEnv` FIFO.
 - `server/vibe-acp.ts` — spawn + ndjson framing + native-id tracking + `callExt`.
 - `server/transformers.ts` — thinking remap (discover/configure) + `session/update` parsing.
 - `server/questions.ts` — `elicitation/create` ↔ Paseo question card mapping (pure, no state).
 - `server/usage-source.ts` — monthly budget via `_account/read` probe (one in-flight probe,
-  60 s positive / 30 s negative cache).
+  60 s positive / 30 s negative cache). The probe needs a live session, so it opens one in
+  `$HOME`: verified on vibe 3.1.3 that an unused session leaves no directory in the shared
+  store (`~/.vibe/logs/session/unified/`), but check it after an upgrade — `/home/ubuntu`
+  sessions with an empty journal mean the probe is polluting the session list.
 - `server/prices.ts` — model prices from `~/.vibe/config.toml` + cost estimate (mtime+TTL
   cached parse, `Number.isFinite` guards).
 - `shared/usage.ts` — zod schema for usage payloads.

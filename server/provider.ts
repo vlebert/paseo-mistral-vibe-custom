@@ -233,11 +233,19 @@ export function createVibeCustomProvider(): ProviderRegistration {
         if (typeof input.token !== "string" || input.token.length === 0) {
           throw new Error("Missing revert token (native message id)");
         }
-        await handle.callExt("_rewind/to", {
+        const result = (await handle.callExt("_rewind/to", {
           sessionId: nativeId,
           messageId: input.token,
           restoreFiles: input.scope === "both",
-        });
+        })) as { restoreErrors?: unknown } | undefined;
+        // vibe restores what it can and reports the rest; surface it instead of dropping it.
+        const restoreErrors = Array.isArray(result?.restoreErrors) ? result.restoreErrors : [];
+        if (restoreErrors.length > 0) {
+          console.error(
+            `[mistral-vibe-custom] rewind restored files with ${restoreErrors.length} error(s):`,
+            JSON.stringify(restoreErrors.slice(0, 3)),
+          );
+        }
         // Paseo closes the session and reopens the latest persistence with history replay.
       }
 

@@ -1,5 +1,4 @@
 import type { AcpTransformer, AcpVendorUpdate } from "@getpaseo/plugin/server/acp";
-import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { usageItemSchema } from "../shared/usage.js";
 
 export const PLUGIN_ID = "mistral-vibe-custom";
@@ -50,12 +49,6 @@ function pick(update: Record<string, unknown>, camel: string, snake: string): un
   return update[camel] ?? update[snake];
 }
 
-function updateOf(notification: { method: string; params: JsonValue }): Record<string, unknown> | null {
-  if (notification.method !== "session/update") return null;
-  const params = notification.params as { update?: Record<string, unknown> } | null;
-  return params?.update ?? null;
-}
-
 export const vibeTransformer: AcpTransformer = {
   async discover(catalog, ctx) {
     // The catalog probe has no user session; try reading the live value, else last known.
@@ -87,19 +80,12 @@ export const vibeTransformer: AcpTransformer = {
     transformerState.fallbackCurrent = level;
     return "handled";
   },
-
-  notification(notification, ctx): AcpVendorUpdate | null {
-    // Standard "session/update" notifications never reach here (the shim routes only
-    // vendor extension methods to transformers); they are tapped at the stream level.
-    const update = updateOf(notification);
-    if (!update) return null;
-    return processSessionUpdate(update, undefined, ctx.sessionId)[0] ?? null;
-  },
 };
 
 /**
  * Handle one raw ACP `session/update` payload. Standard updates are tapped from the
- * connector stream (the shim only forwards vendor extension methods to transformers).
+ * connector stream (the shim only forwards vendor extension methods to transformers, so
+ * `session/update` never reaches `AcpTransformer.notification`).
  * `nativeSessionId` keys all captured state so parallel sessions stay isolated.
  * Returns vendor updates to emit (currently: the usage capture consumed by the wrapper).
  */
@@ -136,7 +122,8 @@ export function processSessionUpdate(
 
   if (kind === "usage_update" && boundarySessionId) {
     const meta = (update._meta ?? {}) as Record<string, unknown>;
-    const cost = pick(update, "cost", "cost") as Record<string, unknown> | undefined;
+    // vibe sends `cost: {amount, currency}` at the top level (see _send_usage_update).
+    const cost = update.cost as Record<string, unknown> | undefined;
     const data = usageItemSchema.parse({
       used: num(pick(update, "used", "used_tokens")),
       size: num(pick(update, "size", "context_window")),

@@ -57,6 +57,8 @@ function withElicitationCapability(message: AcpStreamMessage): AcpStreamMessage 
 }
 
 const MAX_BUFFER_CHARS = 16 * 1024 * 1024;
+/** Kept for the crash log only; vibe's stderr is noisy DEBUG output. */
+const STDERR_TAIL_CHARS = 4096;
 const DEFAULT_EXT_TIMEOUT_MS = 30_000;
 
 interface PendingRequest {
@@ -88,7 +90,12 @@ export function startVibeAcp(
   const args = launch?.args ?? [];
   const env = { ...(launch?.env ?? process.env), ...sessionEnv };
   const child = spawnProcess(command, args, { env, stdio: "pipe" });
-  child.stderr.on("data", () => undefined);
+  // vibe logs DEBUG telemetry to stderr, so it is not forwarded live; keep the tail only to
+  // explain an unexpected exit (a Python traceback would otherwise vanish).
+  let stderrTail = "";
+  child.stderr.on("data", (chunk: Buffer) => {
+    stderrTail = (stderrTail + chunk.toString("utf8")).slice(-STDERR_TAIL_CHARS);
+  });
   child.stdin.on("error", () => undefined); // EPIPE after child death
 
   const encoder = new TextEncoder();
@@ -121,8 +128,22 @@ export function startVibeAcp(
     void terminateProcess(child).catch(() => undefined);
   };
 
-  child.on("error", () => shutdown(new Error("vibe-acp process error")));
-  child.on("exit", () => shutdown(new Error("vibe-acp process exited")));
+  child.on("error", (error) => {
+    // Typically ENOENT: no `vibe-acp` on the daemon's PATH.
+    console.error(`[mistral-vibe-custom] vibe-acp process error: ${error.message}`);
+    shutdown(new Error("vibe-acp process error"));
+  });
+  child.on("exit", (code, signal) => {
+    // `closed` is already true when the exit is ours (session close, cancel, handle.close):
+    // only an exit we did not ask for is worth a log line.
+    if (!closed) {
+      const tail = stderrTail.trim();
+      console.error(
+        `[mistral-vibe-custom] vibe-acp exited unexpectedly (code=${code ?? "null"}, signal=${signal ?? "none"})${tail ? `:\n${tail}` : ""}`,
+      );
+    }
+    shutdown(new Error("vibe-acp process exited"));
+  });
 
   const readable = new ReadableStream<AcpStreamMessage>({
     start(controller) {
@@ -160,9 +181,23 @@ export function startVibeAcp(
               clearTimeout(entry.timer);
               if ("error" in message) entry.reject(new Error(message.error.message));
               else entry.resolve((message as { result: unknown }).result);
+              // Side-channel response: the shim never sent this request, so forwarding it
+              // only earns a "Got response to unknown request" line in the plugin logs.
+              continue;
             }
           }
-          if (onMessage?.(message) === false) continue;
+          // A throw here would escape a stdout "data" handler and take the whole plugin
+          // process (and every live session it serves) down, so keep the tap contained.
+          let forward = true;
+          try {
+            forward = onMessage?.(message) !== false;
+          } catch (error) {
+            console.error(
+              "[mistral-vibe-custom] message tap failed:",
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+          if (!forward) continue;
           try {
             controller.enqueue(message);
           } catch {

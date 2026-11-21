@@ -7,7 +7,6 @@
       "ES2023"
     ],
     "types": [
-      "react",
       "node"
     ],
     "jsx": "react-jsx",
