@@ -25,7 +25,6 @@ import {
   vibeTransformer,
 } from "./transformers.js";
 import type { UsageItemData } from "../shared/usage.js";
-import { estimateCostUsd } from "./prices.js";
 
 /**
  * Capabilities the stock ACP shim does not offer but vibe-acp supports:
@@ -37,7 +36,6 @@ const EXTRA_CAPABILITIES = ["timeline.plugin", "session.revert.conversation", "s
 
 interface LatestVibeUsage {
   data: UsageItemData;
-  model?: string;
 }
 
 /** A question card waiting for the user, with the callback that answers the child. */
@@ -56,7 +54,6 @@ interface ConnCtx {
   boundaryByNative: Map<string, string>;
   lastUserMessage: Map<string, ProviderEvent & { type: "timeline.item" }>;
   latestUsage: Map<string, LatestVibeUsage>;
-  sessionModel: Map<string, string>;
   /** Permission id -> question waiting for the user (only ids minted by this plugin). */
   pendingQuestions: Map<string, PendingQuestionEntry>;
   /** Native session id -> `rawInput` of the last ask_user_question tool call, until used. */
@@ -165,7 +162,7 @@ export function createVibeCustomProvider(): ProviderRegistration {
           if (update.type === "timeline" && boundary && update.item.type === "plugin" && update.item.kind === "vibe-usage") {
             // Captured for the context ring and the usage source; not emitted as an inline
             // timeline item (that info belongs in the ring popover, not between messages).
-            ctx.latestUsage.set(boundary, { data: update.item.data as UsageItemData, model: ctx.sessionModel.get(boundary) });
+            ctx.latestUsage.set(boundary, { data: update.item.data as UsageItemData });
           }
         }
         // Live user messages are emitted by the shim at prompt time, before the chunk
@@ -200,7 +197,6 @@ export function createVibeCustomProvider(): ProviderRegistration {
         boundaryByNative: new Map(),
         lastUserMessage: new Map(),
         latestUsage: new Map(),
-        sessionModel: new Map(),
         pendingQuestions: new Map(),
         pendingToolQuestions: new Map(),
         listeners: new Set(),
@@ -282,7 +278,6 @@ export function createVibeCustomProvider(): ProviderRegistration {
           ctx.sessionHandle.delete(event.sessionId);
           ctx.lastUserMessage.delete(event.sessionId);
           ctx.latestUsage.delete(event.sessionId);
-          ctx.sessionModel.delete(event.sessionId);
         }
         if (event.type === "timeline.item" && event.item.type === "user_message") {
           ctx.lastUserMessage.set(event.sessionId, event);
@@ -300,20 +295,20 @@ export function createVibeCustomProvider(): ProviderRegistration {
           // Merge them so the composer context ring and its click popover get real data.
           const latest = ctx.latestUsage.get(event.sessionId);
           if (latest) {
-            const cost = latest.data.costUsd ?? estimateCostUsd(latest.data, latest.model);
             event = {
               ...event,
               usage: {
                 ...event.usage,
                 contextWindowUsedTokens: latest.data.used ?? event.usage.contextWindowUsedTokens,
                 contextWindowMaxTokens: latest.data.size ?? event.usage.contextWindowMaxTokens,
-                totalCostUsd: Number.isFinite(cost) ? cost : event.usage.totalCostUsd,
+                // vibe's own figure only: it prices cached and uncached input separately, and
+                // omits `cost` when it has no price for the model. Never guess here.
+                totalCostUsd: latest.data.costUsd ?? event.usage.totalCostUsd,
               },
             };
           }
         }
         if (event.type === "session.config") {
-          if (typeof event.config.model === "string") ctx.sessionModel.set(event.sessionId, event.config.model);
           // The stock shim files every non-standard config option as a generic setting,
           // which renders a second thinking selector next to the dedicated one. Drop the
           // generic "thinking" control and surface it as the real thinkingOption instead.

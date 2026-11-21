@@ -75,6 +75,12 @@ tool.
   `user_message` item with the token when the chunk arrives) and replay (attach on the
   item emitted from chunks). If vibe changes when `user_message_chunk` is sent, tokens may
   attach late or missing.
+- **Cost is vibe's number or nothing**: `usage_update.cost.amount` is computed by vibe itself
+  from its model prices (config.toml per alias, deep-merged over the catalog layer) and it
+  prices cached and uncached input separately. It is absent when vibe has no price for the
+  model (`session_cost == 0` → no `cost` field). Never re-derive it here: a local estimator
+  cannot see prices injected by another config layer and silently bills unknown models at
+  whatever rate is hardcoded. No cost shown is correct when vibe is silent.
 - **Usage cards do not attach to plugin-provider agents**: the ring popover's `AgentUsage`
   section needs `usageScopeKey`, which plugin sessions do not expose (daemon-side
   `session.usageSession()`). Session data (context %, tokens, cost) reaches the ring via
@@ -118,8 +124,6 @@ Both providers spawn the same `vibe-acp` binary, so they share one session store
   `$HOME`: verified on vibe 3.1.3 that an unused session leaves no directory in the shared
   store (`~/.vibe/logs/session/unified/`), but check it after an upgrade — `/home/ubuntu`
   sessions with an empty journal mean the probe is polluting the session list.
-- `server/prices.ts` — model prices from `~/.vibe/config.toml` + cost estimate (mtime+TTL
-  cached parse, `Number.isFinite` guards).
 - `shared/usage.ts` — zod schema for usage payloads.
 - `paseo-plugin.json` — manifest; id must stay kebab-case; `requirements.paseo` is the floor.
 
